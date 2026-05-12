@@ -8,11 +8,23 @@ import maya.cmds as mc
 class HandPoseBuilder:
     """Build pose-driven finger SDKs split into per-level sub-poses.
 
-    For each pose discovered under `pose_root`, this creates one float attribute
-    per joint level on the hand ctrl (e.g. poseFist1, poseFist2, poseFist3) so
-    each knuckle level can be dialed independently. Level N's SDK is built with
-    levels 1..N-1 already posed, so the world-space match for child joints is
-    correct. After all levels are keyed, drivers reset to 0.
+    For each pose discovered under `pose_root`, this creates two kinds of
+    float attributes on the hand ctrl:
+
+      - one "whole" attr per pose (e.g. poseFist) that drives every selected
+        level at once,
+      - one "part" attr per level (e.g. poseFist1, poseFist2, poseFist3) that
+        drives only that level.
+
+    A `plusMinusAverage` node per (pose, side, level) sums `whole + part`,
+    and the SDK from that sum's `output1D` drives the finger offsets.  Sums
+    above the SDK's keyed max clamp at the posed value (animCurve constant
+    post-infinity), so dialing whole=10 + partN=10 simply means "full pose".
+
+    Level N's SDK is built with levels 1..N-1 already posed (via the part
+    attr at max), so the world-space match for child joints is correct.
+    After all levels are keyed, part attrs reset to 0 and the whole stays
+    at 0.
 
     `finger_parts` controls which joints receive SDK keys. Three forms:
 
@@ -103,12 +115,17 @@ class HandPoseBuilder:
             self._separator_added.add(hand_ctrl)
 
         levels = self._group_by_level(joints)
-        built_drivers: list[str] = []
+        built_part_attrs: list[str] = []
         match_only_ofsts: set[str] = set()
 
+        whole_attr_name = self._whole_pose_attr_name(pose)
+        whole_attr_plug = f"{hand_ctrl}.{whole_attr_name}"
+
         for level in sorted(levels.keys()):
-            attr_name = self._sub_pose_attr_name(pose, level)
-            driver_attr = f"{hand_ctrl}.{attr_name}"
+            part_attr_name = self._sub_pose_attr_name(pose, level)
+            part_attr_plug = f"{hand_ctrl}.{part_attr_name}"
+            sum_node = self._sum_node_name(side, pose, level)
+            sdk_driver_attr = f"{sum_node}.output1D"
             level_has_sdk = False
 
             for jnt in levels[level]:
@@ -126,11 +143,13 @@ class HandPoseBuilder:
 
                 if self._is_selected(pose, part, level):
                     if not level_has_sdk:
-                        self._add_sub_pose_attr(hand_ctrl, attr_name)
+                        self._add_pose_float_attr(hand_ctrl, whole_attr_name, "whole")
+                        self._add_pose_float_attr(hand_ctrl, part_attr_name, "part")
+                        self._ensure_sum_node(sum_node, whole_attr_plug, part_attr_plug)
                         level_has_sdk = True
-                    self._set_sdk(driver_attr, ctrl_ofst, pose_t, pose_r)
+                    self._set_sdk(sdk_driver_attr, ctrl_ofst, pose_t, pose_r)
                     print(
-                        f"    [SDK] L{level} {driver_attr} -> {ctrl_ofst}  "
+                        f"    [SDK] L{level} {sdk_driver_attr} -> {ctrl_ofst}  "
                         f"t={[round(v, 3) for v in pose_t]}  "
                         f"r={[round(v, 3) for v in pose_r]}"
                     )
@@ -139,13 +158,15 @@ class HandPoseBuilder:
                     print(f"    [match-only] L{level} {ctrl_ofst}")
 
             if level_has_sdk:
-                mc.setAttr(driver_attr, self.max_driver_value)
-                built_drivers.append(driver_attr)
+                # Pose this level via its part attr so the next level's child
+                # joints land correctly in world space.  Whole stays at 0.
+                mc.setAttr(part_attr_plug, self.max_driver_value)
+                built_part_attrs.append(part_attr_plug)
 
-        # Cleanup: drivers back to 0 (SDK pulls keyed ofsts to identity),
-        # then explicitly zero match-only ofsts (no SDK to reset them).
-        for driver_attr in built_drivers:
-            mc.setAttr(driver_attr, 0)
+        # Cleanup: part attrs back to 0 (sum -> 0, SDK pulls keyed ofsts to
+        # identity), then explicitly zero match-only ofsts.
+        for part_attr_plug in built_part_attrs:
+            mc.setAttr(part_attr_plug, 0)
 
         for ctrl_ofst in match_only_ofsts:
             self._zero_offset(ctrl_ofst)
@@ -271,21 +292,46 @@ class HandPoseBuilder:
         else:
             print(f"  [~] Separator exists: {ctrl}.{self.SEPARATOR_ATTR}")
 
-    def _add_sub_pose_attr(self, ctrl: str, attr_name: str) -> None:
+    def _add_pose_float_attr(
+        self, ctrl: str, attr_name: str, label: str = "attr"
+    ) -> None:
         if not mc.attributeQuery(attr_name, node=ctrl, exists=True):
             mc.addAttr(
                 ctrl, longName=attr_name, attributeType="float",
                 minValue=0, maxValue=self.max_driver_value, defaultValue=0,
                 keyable=True,
             )
-            print(f"  [+] Added attr: {ctrl}.{attr_name}")
+            print(f"  [+] Added {label}: {ctrl}.{attr_name}")
         else:
-            print(f"  [~] Attr exists: {ctrl}.{attr_name}")
+            print(f"  [~] {label.capitalize()} exists: {ctrl}.{attr_name}")
+
+    @staticmethod
+    def _whole_pose_attr_name(pose: str) -> str:
+        # Uppercase only the first letter; preserve any camelCase in the token.
+        return f"pose{pose[:1].upper()}{pose[1:]}"
 
     @staticmethod
     def _sub_pose_attr_name(pose: str, level: int) -> str:
-        # Uppercase only the first letter; preserve any camelCase in the token.
-        return f"pose{pose[:1].upper()}{pose[1:]}{level}"
+        return f"{HandPoseBuilder._whole_pose_attr_name(pose)}{level}"
+
+    @staticmethod
+    def _sum_node_name(side: str, pose: str, level: int) -> str:
+        return f"{side}_{pose}_{level}_poseSum"
+
+    def _ensure_sum_node(
+        self, sum_node: str, whole_plug: str, part_plug: str
+    ) -> None:
+        if not mc.objExists(sum_node):
+            mc.createNode("plusMinusAverage", name=sum_node)
+            mc.setAttr(f"{sum_node}.operation", 1)  # 1 == sum
+            print(f"  [+] Created sum node: {sum_node}")
+        self._connect_input(whole_plug, f"{sum_node}.input1D[0]")
+        self._connect_input(part_plug, f"{sum_node}.input1D[1]")
+
+    @staticmethod
+    def _connect_input(src: str, dst: str) -> None:
+        if not mc.isConnected(src, dst):
+            mc.connectAttr(src, dst, force=True)
 
     # ------------------------------------------------------------------
     # Transform + SDK
