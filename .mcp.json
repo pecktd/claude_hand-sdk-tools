@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "MayaMCP": {
+      "command": "C:/Users/peckp/OneDrive/Documents/dev/MayaMCP/.venv/Scripts/python.exe",
+      "args": [
+        "C:/Users/peckp/OneDrive/Documents/dev/MayaMCP/src/maya_mcp_server.py"
+      ]
+    }
+  }
+}
