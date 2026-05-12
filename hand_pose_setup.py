@@ -8,8 +8,9 @@ import maya.cmds as mc
 class HandPoseBuilder:
     """Build pose-driven finger SDKs split into per-level sub-poses.
 
-    For each pose discovered under `pose_root`, this creates two kinds of
-    float attributes on the hand ctrl:
+    For each pose discovered under `pose_root`, this creates a locked
+    separator attr (e.g. `__poseFist__`) followed by two kinds of float
+    attributes on the hand ctrl:
 
       - one "whole" attr per pose (e.g. poseFist) that drives every selected
         level at once,
@@ -44,7 +45,6 @@ class HandPoseBuilder:
     """
 
     FINGER_PARTS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
-    SEPARATOR_ATTR: str = "__pose__"
     DEFAULT_DRIVER_MAX: int = 10
 
     def __init__(
@@ -67,7 +67,6 @@ class HandPoseBuilder:
             self._joint_filter,
             self._global_joint_filter,
         ) = self._normalize_finger_parts(finger_parts)
-        self._separator_added: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -110,16 +109,14 @@ class HandPoseBuilder:
 
         print(f"\n[POSE] '{pose}' [{side}] -> {hand_ctrl}")
 
-        if hand_ctrl not in self._separator_added:
-            self._add_separator(hand_ctrl)
-            self._separator_added.add(hand_ctrl)
-
         levels = self._group_by_level(joints)
         built_part_attrs: list[str] = []
         match_only_ofsts: set[str] = set()
 
+        pose_separator_attr = self._pose_separator_attr_name(pose)
         whole_attr_name = self._whole_pose_attr_name(pose)
         whole_attr_plug = f"{hand_ctrl}.{whole_attr_name}"
+        pose_attrs_added = False
 
         for level in sorted(levels.keys()):
             part_attr_name = self._sub_pose_attr_name(pose, level)
@@ -143,7 +140,10 @@ class HandPoseBuilder:
 
                 if self._is_selected(pose, part, level):
                     if not level_has_sdk:
-                        self._add_pose_float_attr(hand_ctrl, whole_attr_name, "whole")
+                        if not pose_attrs_added:
+                            self._add_separator(hand_ctrl, pose_separator_attr)
+                            self._add_pose_float_attr(hand_ctrl, whole_attr_name, "whole")
+                            pose_attrs_added = True
                         self._add_pose_float_attr(hand_ctrl, part_attr_name, "part")
                         self._ensure_sum_node(sum_node, whole_attr_plug, part_attr_plug)
                         level_has_sdk = True
@@ -281,16 +281,16 @@ class HandPoseBuilder:
     # Attribute helpers
     # ------------------------------------------------------------------
 
-    def _add_separator(self, ctrl: str) -> None:
-        if not mc.attributeQuery(self.SEPARATOR_ATTR, node=ctrl, exists=True):
+    def _add_separator(self, ctrl: str, attr_name: str) -> None:
+        if not mc.attributeQuery(attr_name, node=ctrl, exists=True):
             mc.addAttr(
-                ctrl, longName=self.SEPARATOR_ATTR, attributeType="long",
+                ctrl, longName=attr_name, attributeType="long",
                 defaultValue=0, keyable=True,
             )
-            mc.setAttr(f"{ctrl}.{self.SEPARATOR_ATTR}", lock=True)
-            print(f"  [+] Added separator: {ctrl}.{self.SEPARATOR_ATTR}")
+            mc.setAttr(f"{ctrl}.{attr_name}", lock=True)
+            print(f"  [+] Added separator: {ctrl}.{attr_name}")
         else:
-            print(f"  [~] Separator exists: {ctrl}.{self.SEPARATOR_ATTR}")
+            print(f"  [~] Separator exists: {ctrl}.{attr_name}")
 
     def _add_pose_float_attr(
         self, ctrl: str, attr_name: str, label: str = "attr"
@@ -309,6 +309,10 @@ class HandPoseBuilder:
     def _whole_pose_attr_name(pose: str) -> str:
         # Uppercase only the first letter; preserve any camelCase in the token.
         return f"pose{pose[:1].upper()}{pose[1:]}"
+
+    @staticmethod
+    def _pose_separator_attr_name(pose: str) -> str:
+        return f"__pose{pose[:1].upper()}{pose[1:]}__"
 
     @staticmethod
     def _sub_pose_attr_name(pose: str, level: int) -> str:
