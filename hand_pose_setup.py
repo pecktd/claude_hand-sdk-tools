@@ -27,7 +27,7 @@ class HandPoseBuilder:
     After all levels are keyed, part attrs reset to 0 and the whole stays
     at 0.
 
-    `finger_parts` controls which joints receive SDK keys. Three forms:
+    `finger_parts` controls which joints receive SDK keys. Forms:
 
       - None: every finger, every level, for every discovered pose.
 
@@ -35,13 +35,27 @@ class HandPoseBuilder:
         those fingers get SDK; other finger chains are still match-posed for
         hierarchy correctness then zeroed in cleanup.
 
-      - dict {pose_name: [entries]}: builds *only* the listed poses. Each
-        entry is "finger" (all levels) or "finger_N" (specific level only).
-        Example:
-            {"fist": ["thumb", "index_2", "middle_2"]}
-        Joints matched but not selected (e.g. middle_1 in the example above)
-        are still posed during the build so child joints land correctly in
-        world space, then zeroed back to identity in the cleanup pass.
+      - dict {pose_name: value}: builds *only* the listed poses.  `value`
+        may be either of:
+
+          * flat list/tuple of entries.  Each entry is "finger" (all levels)
+            or "finger_N" (specific level).  Example:
+                {"fist": ["thumb", "index_2", "middle_2"]}
+
+          * nested dict {level_str: [finger_entries]}, grouped by level.
+            The outer key is the level as a string (matching the sub-pose
+            attr suffix, e.g. "1" -> `poseFist1`).  Inner entries are
+            finger names; a trailing "_N" suffix is tolerated and stripped
+            (the outer level key is authoritative).  Example:
+                {"fist": {
+                    "1": ["thumb_1", "index_1", "middle_1"],
+                    "2": ["thumb_2", "index_2"],
+                }}
+            Levels not listed receive no SDK.
+
+        In all forms, joints matched but not selected for SDK are still
+        posed during the build so child joints land correctly in world
+        space, then zeroed back to identity in the cleanup pass.
     """
 
     FINGER_PARTS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
@@ -52,7 +66,10 @@ class HandPoseBuilder:
         pose_root: str = "hand_pose_grp",
         sides: tuple[str, ...] = ("lft", "rgt"),
         finger_parts: (
-            dict[str, list[str] | tuple[str, ...]]
+            dict[
+                str,
+                list[str] | tuple[str, ...] | dict[str, list[str] | tuple[str, ...]],
+            ]
             | list[str]
             | tuple[str, ...]
             | None
@@ -178,7 +195,10 @@ class HandPoseBuilder:
     def _normalize_finger_parts(
         self,
         fp: (
-            dict[str, list[str] | tuple[str, ...]]
+            dict[
+                str,
+                list[str] | tuple[str, ...] | dict[str, list[str] | tuple[str, ...]],
+            ]
             | list[str]
             | tuple[str, ...]
             | None
@@ -201,9 +221,12 @@ class HandPoseBuilder:
             return None, {}, None
         if isinstance(fp, dict):
             pose_filter: set[str] = set(fp.keys())
-            joint_filter: dict[str, frozenset[tuple[str, int | None]]] = {
-                p: self._parse_entries(v) for p, v in fp.items()
-            }
+            joint_filter: dict[str, frozenset[tuple[str, int | None]]] = {}
+            for pose, value in fp.items():
+                if isinstance(value, dict):
+                    joint_filter[pose] = self._parse_nested_entries(value)
+                else:
+                    joint_filter[pose] = self._parse_entries(value)
             # Empty global filter: any pose not in the dict matches nothing.
             # In practice pose_filter excludes those poses entirely.
             return pose_filter, joint_filter, frozenset()
@@ -223,9 +246,28 @@ class HandPoseBuilder:
                 out.add((s, None))
         return frozenset(out)
 
-    def _filter_for_pose(
-        self, pose: str
-    ) -> frozenset[tuple[str, int | None]] | None:
+    @staticmethod
+    def _parse_nested_entries(
+        sub_poses: dict[str, list[str] | tuple[str, ...]],
+    ) -> frozenset[tuple[str, int | None]]:
+        """Parse {"1": [...], "2": [...]} into (finger, level) pairs.
+
+        The outer key is the level (str of int) and is authoritative; any
+        trailing "_N" suffix on entries is stripped.
+        """
+        out: set[tuple[str, int | None]] = set()
+        for level_key, entries in sub_poses.items():
+            level = int(level_key)
+            for e in entries:
+                s = str(e)
+                head, _, tail = s.rpartition("_")
+                if head and tail.isdigit():
+                    out.add((head, level))
+                else:
+                    out.add((s, level))
+        return frozenset(out)
+
+    def _filter_for_pose(self, pose: str) -> frozenset[tuple[str, int | None]] | None:
         if pose in self._joint_filter:
             return self._joint_filter[pose]
         return self._global_joint_filter
@@ -284,21 +326,26 @@ class HandPoseBuilder:
     def _add_separator(self, ctrl: str, attr_name: str) -> None:
         if not mc.attributeQuery(attr_name, node=ctrl, exists=True):
             mc.addAttr(
-                ctrl, longName=attr_name, attributeType="long",
-                defaultValue=0, keyable=True,
+                ctrl,
+                longName=attr_name,
+                attributeType="long",
+                defaultValue=0,
+                keyable=True,
             )
             mc.setAttr(f"{ctrl}.{attr_name}", lock=True)
             print(f"  [+] Added separator: {ctrl}.{attr_name}")
         else:
             print(f"  [~] Separator exists: {ctrl}.{attr_name}")
 
-    def _add_pose_float_attr(
-        self, ctrl: str, attr_name: str, label: str = "attr"
-    ) -> None:
+    def _add_pose_float_attr(self, ctrl: str, attr_name: str, label: str = "attr") -> None:
         if not mc.attributeQuery(attr_name, node=ctrl, exists=True):
             mc.addAttr(
-                ctrl, longName=attr_name, attributeType="float",
-                minValue=0, maxValue=self.max_driver_value, defaultValue=0,
+                ctrl,
+                longName=attr_name,
+                attributeType="float",
+                minValue=0,
+                maxValue=self.max_driver_value,
+                defaultValue=0,
                 keyable=True,
             )
             print(f"  [+] Added {label}: {ctrl}.{attr_name}")
@@ -322,9 +369,7 @@ class HandPoseBuilder:
     def _sum_node_name(side: str, pose: str, level: int) -> str:
         return f"{side}_{pose}_{level}_poseSum"
 
-    def _ensure_sum_node(
-        self, sum_node: str, whole_plug: str, part_plug: str
-    ) -> None:
+    def _ensure_sum_node(self, sum_node: str, whole_plug: str, part_plug: str) -> None:
         if not mc.objExists(sum_node):
             mc.createNode("plusMinusAverage", name=sum_node)
             mc.setAttr(f"{sum_node}.operation", 1)  # 1 == sum
@@ -342,9 +387,7 @@ class HandPoseBuilder:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _match_transform(
-        source: str, target: str
-    ) -> tuple[list[float], list[float]]:
+    def _match_transform(source: str, target: str) -> tuple[list[float], list[float]]:
         ws_t = mc.xform(source, q=True, ws=True, t=True)
         ws_r = mc.xform(source, q=True, ws=True, ro=True)
         mc.xform(target, ws=True, t=ws_t)
@@ -355,8 +398,7 @@ class HandPoseBuilder:
 
     @staticmethod
     def _zero_offset(ctrl_ofst: str) -> None:
-        for attr in ("translateX", "translateY", "translateZ",
-                     "rotateX", "rotateY", "rotateZ"):
+        for attr in ("translateX", "translateY", "translateZ", "rotateX", "rotateY", "rotateZ"):
             plug = f"{ctrl_ofst}.{attr}"
             try:
                 mc.setAttr(plug, 0.0)
@@ -374,24 +416,22 @@ class HandPoseBuilder:
             ("translateX", pose_t[0]),
             ("translateY", pose_t[1]),
             ("translateZ", pose_t[2]),
-            ("rotateX",    pose_r[0]),
-            ("rotateY",    pose_r[1]),
-            ("rotateZ",    pose_r[2]),
+            ("rotateX", pose_r[0]),
+            ("rotateY", pose_r[1]),
+            ("rotateZ", pose_r[2]),
         )
         for attr, posed_value in attrs:
             mc.setDrivenKeyframe(
-                ctrl_ofst, attribute=attr,
+                ctrl_ofst,
+                attribute=attr,
                 currentDriver=driver_attr,
-                driverValue=0, value=0.0,
+                driverValue=0,
+                value=0.0,
             )
             mc.setDrivenKeyframe(
-                ctrl_ofst, attribute=attr,
+                ctrl_ofst,
+                attribute=attr,
                 currentDriver=driver_attr,
-                driverValue=self.max_driver_value, value=posed_value,
+                driverValue=self.max_driver_value,
+                value=posed_value,
             )
-
-
-if __name__ == "__main__":
-    HandPoseBuilder().build()
-
-HandPoseBuilder().build()
