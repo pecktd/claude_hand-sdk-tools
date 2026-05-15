@@ -1,3 +1,21 @@
+r"""Caller:
+
+import sys, importlib
+
+project_path = r"C:\dev\hand_pose_with_sdk"
+if project_path not in sys.path:
+    sys.path.insert(0, project_path)
+
+import zone_corrective
+importlib.reload(zone_corrective)
+
+zone_corrective.ZoneCorrectiveBuilder(
+    weighted_geo="blendWeights_2_ma:L_arm_001_GEO_blendWeights",
+    influence_joint="blendWeights_2_ma:lft_zone_1_guide",
+    orig_shape="L_arm_001_GEO_orig",
+    target_shape="L_arm_001_GEO_testFist_target",
+).build()
+"""
 from __future__ import annotations
 
 from typing import cast

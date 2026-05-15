@@ -1,3 +1,25 @@
+r"""Caller:
+
+import sys, importlib
+
+project_path = r"C:\dev\hand_pose_with_sdk"
+if project_path not in sys.path:
+    sys.path.insert(0, project_path)
+
+import hand_pose_setup
+importlib.reload(hand_pose_setup)
+
+hand_pose_setup.HandPoseBuilder(
+    finger_parts={
+        "fist": {
+            "1": ["thumb_1", "index_1", "middle_1", "ring_1", "pinky_1"],
+            "2": ["thumb_2", "index_2", "middle_2", "ring_2", "pinky_2"],
+            "3": ["thumb_3", "index_3", "middle_3", "ring_3", "pinky_3"],
+        },
+        "pistol": None,
+    },
+).build()
+"""
 from __future__ import annotations
 
 from typing import cast
@@ -27,35 +49,33 @@ class HandPoseBuilder:
     After all levels are keyed, part attrs reset to 0 and the whole stays
     at 0.
 
-    `finger_parts` controls which joints receive SDK keys. Forms:
+    `finger_parts` selects which joints receive SDK keys.  It is a dict
+    keyed by pose name; each value is either a nested dict grouped by
+    sub-pose level (per-level mode) or `None` (whole-only mode):
 
-      - None: every finger, every level, for every discovered pose.
+        {
+            "fist": {
+                "1": ["thumb_1", "index_1", "middle_1"],
+                "2": ["thumb_2", "index_2"],
+            },
+            "pistol": None,
+        }
 
-      - flat tuple/list of finger names (e.g. ("index", "middle")): only
-        those fingers get SDK; other finger chains are still match-posed for
-        hierarchy correctness then zeroed in cleanup.
+    Only poses listed in the outer dict are built.
 
-      - dict {pose_name: value}: builds *only* the listed poses.  `value`
-        may be either of:
+    Per-level mode: only the listed levels get SDK keys, summed with the
+    whole attr through a `plusMinusAverage` per level.  The level string
+    matches the sub-pose attr suffix (e.g. "1" -> `poseFist1`).  Inner
+    entries are finger names; a trailing "_N" suffix is tolerated but
+    ignored — the outer level key is authoritative.
 
-          * flat list/tuple of entries.  Each entry is "finger" (all levels)
-            or "finger_N" (specific level).  Example:
-                {"fist": ["thumb", "index_2", "middle_2"]}
+    Whole-only mode (`None`): only the separator and whole attr are added;
+    every joint in the pose is SDK-driven directly from the whole attr,
+    with no per-level part attrs or sum nodes.
 
-          * nested dict {level_str: [finger_entries]}, grouped by level.
-            The outer key is the level as a string (matching the sub-pose
-            attr suffix, e.g. "1" -> `poseFist1`).  Inner entries are
-            finger names; a trailing "_N" suffix is tolerated and stripped
-            (the outer level key is authoritative).  Example:
-                {"fist": {
-                    "1": ["thumb_1", "index_1", "middle_1"],
-                    "2": ["thumb_2", "index_2"],
-                }}
-            Levels not listed receive no SDK.
-
-        In all forms, joints matched but not selected for SDK are still
-        posed during the build so child joints land correctly in world
-        space, then zeroed back to identity in the cleanup pass.
+    Joints that are matched but not selected for SDK are still posed during
+    the build so child joints land correctly in world space, then zeroed
+    back to identity in the cleanup pass.
     """
 
     FINGER_PARTS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
@@ -63,27 +83,19 @@ class HandPoseBuilder:
 
     def __init__(
         self,
+        finger_parts: dict[str, dict[str, list[str] | tuple[str, ...]] | None],
         pose_root: str = "hand_pose_grp",
         sides: tuple[str, ...] = ("lft", "rgt"),
-        finger_parts: (
-            dict[
-                str,
-                list[str] | tuple[str, ...] | dict[str, list[str] | tuple[str, ...]],
-            ]
-            | list[str]
-            | tuple[str, ...]
-            | None
-        ) = None,
         max_driver_value: float = DEFAULT_DRIVER_MAX,
     ) -> None:
         self.pose_root: str = pose_root
         self.sides: tuple[str, ...] = tuple(sides)
         self.max_driver_value: float = max_driver_value
-        (
-            self._pose_filter,
-            self._joint_filter,
-            self._global_joint_filter,
-        ) = self._normalize_finger_parts(finger_parts)
+        self._pose_filter: set[str] = set(finger_parts.keys())
+        self._joint_filter: dict[str, frozenset[tuple[str, int]] | None] = {
+            pose: None if value is None else self._parse_nested_entries(value)
+            for pose, value in finger_parts.items()
+        }
 
     # ------------------------------------------------------------------
     # Public API
@@ -110,7 +122,7 @@ class HandPoseBuilder:
         side: str,
         joints: list[str] | None = None,
     ) -> None:
-        if self._pose_filter is not None and pose not in self._pose_filter:
+        if pose not in self._pose_filter:
             return
 
         hand_ctrl = f"{side}_hand_ctrl"
@@ -124,9 +136,21 @@ class HandPoseBuilder:
                 mc.warning(f"No finger joints found for pose='{pose}' side='{side}'.")
                 return
 
+        levels = self._group_by_level(joints)
+        if self._joint_filter[pose] is None:
+            self._build_pose_whole_only(pose, side, hand_ctrl, levels)
+        else:
+            self._build_pose_per_level(pose, side, hand_ctrl, levels)
+
+    def _build_pose_per_level(
+        self,
+        pose: str,
+        side: str,
+        hand_ctrl: str,
+        levels: dict[int, list[str]],
+    ) -> None:
         print(f"\n[POSE] '{pose}' [{side}] -> {hand_ctrl}")
 
-        levels = self._group_by_level(joints)
         built_part_attrs: list[str] = []
         match_only_ofsts: set[str] = set()
 
@@ -163,6 +187,7 @@ class HandPoseBuilder:
                             pose_attrs_added = True
                         self._add_pose_float_attr(hand_ctrl, part_attr_name, "part")
                         self._ensure_sum_node(sum_node, whole_attr_plug, part_attr_plug)
+                        self._ensure_norm_mult(f"{side}_{part_attr_name}_outMult", sdk_driver_attr)
                         level_has_sdk = True
                     self._set_sdk(sdk_driver_attr, ctrl_ofst, pose_t, pose_r)
                     print(
@@ -188,95 +213,73 @@ class HandPoseBuilder:
         for ctrl_ofst in match_only_ofsts:
             self._zero_offset(ctrl_ofst)
 
-    # ------------------------------------------------------------------
-    # Filter normalization
-    # ------------------------------------------------------------------
-
-    def _normalize_finger_parts(
+    def _build_pose_whole_only(
         self,
-        fp: (
-            dict[
-                str,
-                list[str] | tuple[str, ...] | dict[str, list[str] | tuple[str, ...]],
-            ]
-            | list[str]
-            | tuple[str, ...]
-            | None
-        ),
-    ) -> tuple[
-        set[str] | None,
-        dict[str, frozenset[tuple[str, int | None]]],
-        frozenset[tuple[str, int | None]] | None,
-    ]:
-        """Return (pose_filter, joint_filter, global_joint_filter).
+        pose: str,
+        side: str,
+        hand_ctrl: str,
+        levels: dict[int, list[str]],
+    ) -> None:
+        print(f"\n[POSE] '{pose}' [{side}] -> {hand_ctrl}  (whole-only)")
 
-        pose_filter: set[str] or None.  None = build all discovered poses.
-        joint_filter: dict[pose, frozenset[(finger, level_or_None)]].
-                      Explicit per-pose subset.
-        global_joint_filter: frozenset[(finger, level_or_None)] or None.
-                             Used for any pose not in joint_filter.  None =
-                             no filter (all fingers, all levels).
-        """
-        if fp is None:
-            return None, {}, None
-        if isinstance(fp, dict):
-            pose_filter: set[str] = set(fp.keys())
-            joint_filter: dict[str, frozenset[tuple[str, int | None]]] = {}
-            for pose, value in fp.items():
-                if isinstance(value, dict):
-                    joint_filter[pose] = self._parse_nested_entries(value)
-                else:
-                    joint_filter[pose] = self._parse_entries(value)
-            # Empty global filter: any pose not in the dict matches nothing.
-            # In practice pose_filter excludes those poses entirely.
-            return pose_filter, joint_filter, frozenset()
-        return None, {}, self._parse_entries(fp)
+        separator_attr = self._pose_separator_attr_name(pose)
+        whole_attr_name = self._whole_pose_attr_name(pose)
+        whole_attr_plug = f"{hand_ctrl}.{whole_attr_name}"
 
-    @staticmethod
-    def _parse_entries(
-        entries: list[str] | tuple[str, ...],
-    ) -> frozenset[tuple[str, int | None]]:
-        out: set[tuple[str, int | None]] = set()
-        for e in entries:
-            s = str(e)
-            head, _, tail = s.rpartition("_")
-            if head and tail.isdigit():
-                out.add((head, int(tail)))
-            else:
-                out.add((s, None))
-        return frozenset(out)
+        self._add_separator(hand_ctrl, separator_attr)
+        self._add_pose_float_attr(hand_ctrl, whole_attr_name, "whole")
+        self._ensure_norm_mult(f"{side}_{whole_attr_name}_outMult", whole_attr_plug)
+        # Pre-set whole to max so each newly keyed joint snaps to its posed
+        # value as its SDK is added, letting child levels match correctly
+        # in world space.  No SDK exists yet, so this is a no-op until the
+        # first key is set.
+        mc.setAttr(whole_attr_plug, self.max_driver_value)
+
+        for level in sorted(levels.keys()):
+            for jnt in levels[level]:
+                tokens = jnt.split("_")
+                part = tokens[2]
+                ctrl_ofst = f"{side}_{part}_{level}_ctrl_ofst"
+
+                if not mc.objExists(ctrl_ofst):
+                    mc.warning(f"  Missing ctrl_ofst: {ctrl_ofst}")
+                    continue
+
+                pose_t, pose_r = self._match_transform(jnt, ctrl_ofst)
+                self._set_sdk(whole_attr_plug, ctrl_ofst, pose_t, pose_r)
+                print(
+                    f"    [SDK] L{level} {whole_attr_plug} -> {ctrl_ofst}  "
+                    f"t={[round(v, 3) for v in pose_t]}  "
+                    f"r={[round(v, 3) for v in pose_r]}"
+                )
+
+        mc.setAttr(whole_attr_plug, 0)
+
+    # ------------------------------------------------------------------
+    # Filter
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _parse_nested_entries(
         sub_poses: dict[str, list[str] | tuple[str, ...]],
-    ) -> frozenset[tuple[str, int | None]]:
+    ) -> frozenset[tuple[str, int]]:
         """Parse {"1": [...], "2": [...]} into (finger, level) pairs.
 
         The outer key is the level (str of int) and is authoritative; any
         trailing "_N" suffix on entries is stripped.
         """
-        out: set[tuple[str, int | None]] = set()
+        out: set[tuple[str, int]] = set()
         for level_key, entries in sub_poses.items():
             level = int(level_key)
             for e in entries:
                 s = str(e)
                 head, _, tail = s.rpartition("_")
-                if head and tail.isdigit():
-                    out.add((head, level))
-                else:
-                    out.add((s, level))
+                finger = head if head and tail.isdigit() else s
+                out.add((finger, level))
         return frozenset(out)
 
-    def _filter_for_pose(self, pose: str) -> frozenset[tuple[str, int | None]] | None:
-        if pose in self._joint_filter:
-            return self._joint_filter[pose]
-        return self._global_joint_filter
-
     def _is_selected(self, pose: str, finger: str, level: int) -> bool:
-        flt = self._filter_for_pose(pose)
-        if flt is None:
-            return True
-        return (finger, None) in flt or (finger, level) in flt
+        return (finger, level) in self._joint_filter[pose]
 
     # ------------------------------------------------------------------
     # Discovery
@@ -352,6 +355,33 @@ class HandPoseBuilder:
         else:
             print(f"  [~] {label.capitalize()} exists: {ctrl}.{attr_name}")
 
+    def _ensure_norm_mult(self, mult_node: str, source_plug: str) -> None:
+        """Create a `multDoubleLinear` that scales `source_plug` by
+        `1 / max_driver_value`, producing a 0..1 normalized signal.  The
+        node's `.output` is left unconnected — downstream rigs wire it as
+        needed.
+
+        Any prior incoming connection on `.input1` that doesn't match
+        `source_plug` is explicitly broken first, so reruns over a scene
+        built by an older script version are correctly rewired.
+        """
+        if not mc.objExists(mult_node):
+            mc.createNode("multDoubleLinear", name=mult_node)
+            print(f"  [+] Created norm-mult: {mult_node}")
+        mc.setAttr(f"{mult_node}.input2", 1.0 / self.max_driver_value)
+
+        input1_plug = f"{mult_node}.input1"
+        existing = mc.listConnections(
+            input1_plug, source=True, destination=False, plugs=True
+        ) or []
+        for src in existing:
+            if src != source_plug:
+                mc.disconnectAttr(src, input1_plug)
+                print(f"  [-] Disconnected stale source: {src} -X-> {input1_plug}")
+        if not mc.isConnected(source_plug, input1_plug):
+            mc.connectAttr(source_plug, input1_plug, force=True)
+            print(f"  [+] Connected: {source_plug} -> {input1_plug}")
+
     @staticmethod
     def _whole_pose_attr_name(pose: str) -> str:
         # Uppercase only the first letter; preserve any camelCase in the token.
@@ -398,7 +428,14 @@ class HandPoseBuilder:
 
     @staticmethod
     def _zero_offset(ctrl_ofst: str) -> None:
-        for attr in ("translateX", "translateY", "translateZ", "rotateX", "rotateY", "rotateZ"):
+        for attr in (
+            "translateX",
+            "translateY",
+            "translateZ",
+            "rotateX",
+            "rotateY",
+            "rotateZ",
+        ):
             plug = f"{ctrl_ofst}.{attr}"
             try:
                 mc.setAttr(plug, 0.0)
