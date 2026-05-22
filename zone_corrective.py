@@ -16,6 +16,7 @@ zone_corrective.ZoneCorrectiveBuilder(
     target_shape="L_arm_001_GEO_testFist_target",
 ).build()
 """
+
 from __future__ import annotations
 
 from typing import cast
@@ -47,6 +48,7 @@ class ZoneCorrectiveBuilder:
     """
 
     SPACE: int = om.MSpace.kObject
+    TARGETS_GROUP: str = "targets_group"
 
     def __init__(
         self,
@@ -75,22 +77,15 @@ class ZoneCorrectiveBuilder:
         self._require_same_count("orig", len(orig_pts), "target", len(target_pts))
 
         skin_cluster = self._find_skin_cluster(self.weighted_geo)
-        weights = self._influence_weights(
-            skin_cluster, self.weighted_geo, self.influence_joint
-        )
-        self._require_same_count(
-            "weighted_geo", len(weights), "orig", len(orig_pts)
-        )
+        weights = self._influence_weights(skin_cluster, self.weighted_geo, self.influence_joint)
+        self._require_same_count("weighted_geo", len(weights), "orig", len(orig_pts))
 
-        out_name = self.name or self._default_name(
-            self.target_shape, self.influence_joint
-        )
-        new_mesh = cast(
-            "list[str]", mc.duplicate(self.orig_shape, name=out_name)
-        )[0]
+        out_name = self.name or self._default_name(self.influence_joint)
+        new_mesh = cast("list[str]", mc.duplicate(self.orig_shape, name=out_name))[0]
         print(f"  [+] Duplicated '{self.orig_shape}' -> '{new_mesh}'")
 
         self._apply_weighted_deltas(new_mesh, orig_pts, target_pts, weights)
+        new_mesh = self._parent_to_targets_group(new_mesh)
         print(
             f"[ZONE] '{new_mesh}' "
             f"<- target='{self.target_shape}' "
@@ -113,13 +108,9 @@ class ZoneCorrectiveBuilder:
                 raise RuntimeError(f"Node not found: {node}")
 
     @staticmethod
-    def _require_same_count(
-        a_name: str, a_count: int, b_name: str, b_count: int
-    ) -> None:
+    def _require_same_count(a_name: str, a_count: int, b_name: str, b_count: int) -> None:
         if a_count != b_count:
-            raise RuntimeError(
-                f"Vertex count mismatch: {a_name}={a_count}, {b_name}={b_count}."
-            )
+            raise RuntimeError(f"Vertex count mismatch: {a_name}={a_count}, {b_name}={b_count}.")
 
     # ------------------------------------------------------------------
     # Naming
@@ -130,11 +121,22 @@ class ZoneCorrectiveBuilder:
         return node.split("|")[-1].split(":")[-1]
 
     @classmethod
-    def _default_name(cls, target_shape: str, influence_joint: str) -> str:
-        return (
-            f"{cls._short_name(target_shape)}_"
-            f"{cls._short_name(influence_joint)}_zone"
-        )
+    def _default_name(cls, influence_joint: str) -> str:
+        base = cls._short_name(influence_joint)
+        if base.endswith("_guide"):
+            base = base[: -len("_guide")]
+        return f"{base}_shape"
+
+    # ------------------------------------------------------------------
+    # Grouping
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _parent_to_targets_group(cls, mesh: str) -> str:
+        if not mc.objExists(cls.TARGETS_GROUP):
+            mc.group(empty=True, name=cls.TARGETS_GROUP)
+        parented = cast("list[str]", mc.parent(mesh, cls.TARGETS_GROUP))
+        return parented[0]
 
     # ------------------------------------------------------------------
     # Mesh access
@@ -167,9 +169,7 @@ class ZoneCorrectiveBuilder:
             raise RuntimeError(f"No skinCluster found on '{geo}'.")
         return clusters[0]
 
-    def _influence_weights(
-        self, skin_cluster: str, geo: str, joint: str
-    ) -> list[float]:
+    def _influence_weights(self, skin_cluster: str, geo: str, joint: str) -> list[float]:
         sc_sel = om.MSelectionList()
         sc_sel.add(skin_cluster)
         sc_fn = oma.MFnSkinCluster(sc_sel.getDependNode(0))
@@ -179,8 +179,7 @@ class ZoneCorrectiveBuilder:
         if index < 0:
             names = [influences[i].partialPathName() for i in range(len(influences))]
             raise RuntimeError(
-                f"'{joint}' is not an influence of '{skin_cluster}'. "
-                f"Influences: {names}"
+                f"'{joint}' is not an influence of '{skin_cluster}'. " f"Influences: {names}"
             )
 
         geo_dag = self._shape_dag(geo)
@@ -189,17 +188,11 @@ class ZoneCorrectiveBuilder:
         comp = comp_fn.create(om.MFn.kMeshVertComponent)
         comp_fn.setCompleteData(vert_count)
 
-        all_weights, num_infl = cast(
-            "tuple[list[float], int]", sc_fn.getWeights(geo_dag, comp)
-        )
-        return [
-            all_weights[v * num_infl + index] for v in range(vert_count)
-        ]
+        all_weights, num_infl = cast("tuple[list[float], int]", sc_fn.getWeights(geo_dag, comp))
+        return [all_weights[v * num_infl + index] for v in range(vert_count)]
 
     @staticmethod
-    def _find_influence_index(
-        influences: list[om.MDagPath], joint: str
-    ) -> int:
+    def _find_influence_index(influences: list[om.MDagPath], joint: str) -> int:
         sel = om.MSelectionList()
         sel.add(joint)
         target_full = cast("om.MDagPath", sel.getDagPath(0)).fullPathName()
@@ -225,11 +218,13 @@ class ZoneCorrectiveBuilder:
             w = weights[i]
             op = orig_pts[i]
             tp = target_pts[i]
-            new_pts.append(om.MPoint(
-                op.x + (tp.x - op.x) * w,
-                op.y + (tp.y - op.y) * w,
-                op.z + (tp.z - op.z) * w,
-            ))
+            new_pts.append(
+                om.MPoint(
+                    op.x + (tp.x - op.x) * w,
+                    op.y + (tp.y - op.y) * w,
+                    op.z + (tp.z - op.z) * w,
+                )
+            )
         fn.setPoints(new_pts, self.SPACE)
         fn.updateSurface()
 
