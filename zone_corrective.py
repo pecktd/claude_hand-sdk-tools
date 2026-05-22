@@ -10,6 +10,7 @@ import zone_corrective
 importlib.reload(zone_corrective)
 
 zone_corrective.ZoneCorrectiveBuilder(
+    pose="fist",
     weighted_geo="blendWeights_2_ma:L_arm_001_GEO_blendWeights",
     influence_joint="blendWeights_2_ma:lft_zone_1_guide",
     orig_shape="L_arm_001_GEO_orig",
@@ -40,6 +41,7 @@ class ZoneCorrectiveBuilder:
 
     Example:
         ZoneCorrectiveBuilder(
+            pose="fist",
             weighted_geo="blendWeights_2_ma:L_arm_001_GEO_blendWeights",
             influence_joint="blendWeights_2_ma:lft_zone_1_guide",
             orig_shape="L_arm_001_GEO_orig",
@@ -52,12 +54,14 @@ class ZoneCorrectiveBuilder:
 
     def __init__(
         self,
+        pose: str,
         weighted_geo: str,
         influence_joint: str,
         orig_shape: str,
         target_shape: str,
         name: str | None = None,
     ) -> None:
+        self.pose: str = pose
         self.weighted_geo: str = weighted_geo
         self.influence_joint: str = influence_joint
         self.orig_shape: str = orig_shape
@@ -80,7 +84,7 @@ class ZoneCorrectiveBuilder:
         weights = self._influence_weights(skin_cluster, self.weighted_geo, self.influence_joint)
         self._require_same_count("weighted_geo", len(weights), "orig", len(orig_pts))
 
-        out_name = self.name or self._default_name(self.influence_joint)
+        out_name = self.name or self._default_name(self.pose, self.influence_joint)
         new_mesh = cast("list[str]", mc.duplicate(self.orig_shape, name=out_name))[0]
         print(f"  [+] Duplicated '{self.orig_shape}' -> '{new_mesh}'")
 
@@ -121,11 +125,14 @@ class ZoneCorrectiveBuilder:
         return node.split("|")[-1].split(":")[-1]
 
     @classmethod
-    def _default_name(cls, influence_joint: str) -> str:
+    def _default_name(cls, pose: str, influence_joint: str) -> str:
         base = cls._short_name(influence_joint)
         if base.endswith("_guide"):
             base = base[: -len("_guide")]
-        return f"{base}_shape"
+        side, _, rest = base.partition("_")
+        if rest:
+            return f"{side}_{pose}_{rest}_shape"
+        return f"{pose}_{base}_shape"
 
     # ------------------------------------------------------------------
     # Grouping
@@ -231,6 +238,7 @@ class ZoneCorrectiveBuilder:
 
 if __name__ == "__main__":
     ZoneCorrectiveBuilder(
+        pose="fist",
         weighted_geo="blendWeights_2_ma:L_arm_001_GEO_blendWeights",
         influence_joint="blendWeights_2_ma:lft_zone_1_guide",
         orig_shape="L_arm_001_GEO_orig",
