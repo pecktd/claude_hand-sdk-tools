@@ -14,6 +14,7 @@ add_zone_attrs.ZoneAttributeBuilder(
     node="lft_hand_ctrl",
 ).run()
 """
+
 from __future__ import annotations
 
 import maya.cmds as mc
@@ -31,12 +32,13 @@ class ZoneAttributeBuilder:
     ATTRIBUTES: tuple[str, ...] = (
         "wrist",
         "upper_hand",
+        "lower_hand",
         "upper_thumb_1",
+        "lower_thumb_1",
         "thumb_2",
         "thumb_3",
         "thumb_4",
         "thumb_5",
-        "lower_thumb_1",
         "upper_index_2",
         "lower_index_2",
         "index_3",
@@ -58,6 +60,8 @@ class ZoneAttributeBuilder:
         "ring_5",
         "ring_6",
         "ring_7",
+        "upper_pinky_1",
+        "lower_pinky_1",
         "upper_pinky_2",
         "lower_pinky_2",
         "pinky_3",
@@ -65,7 +69,6 @@ class ZoneAttributeBuilder:
         "pinky_5",
         "pinky_6",
         "pinky_7",
-        "lower_hand",
     )
 
     def __init__(
