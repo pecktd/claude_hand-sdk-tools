@@ -11,8 +11,7 @@ importlib.reload(zone_corrective)
 
 zone_corrective.ZoneCorrectiveBuilder(
     pose="fist",
-    weighted_geo="blendWeights_2_ma:L_arm_001_GEO_blendWeights",
-    influence_joint="blendWeights_2_ma:lft_zone_1_guide",
+    skin_cluster="blendWeights_2_ma:L_arm_001_GEO_zoneWeight_skinCluster",
     orig_shape="L_arm_001_GEO_orig",
     target_shape="L_arm_001_GEO_testFist_target",
 ).build()
@@ -28,22 +27,28 @@ import maya.cmds as mc
 
 
 class ZoneCorrectiveBuilder:
-    """Bake a target-shape delta into a new mesh, masked by a joint's skin weight.
+    """Bake target-shape deltas into per-influence meshes, masked by each
+    influence's skinCluster weight.
 
-    The skinCluster on `weighted_geo` is treated as a painted mask: each vertex's
-    weight for `influence_joint` (0..1) scales that vertex's (target - orig)
-    delta when applied to a duplicate of `orig_shape`:
+    The skinCluster on the geometry it drives is treated as a partition of
+    the target delta: every influence gets one corrective shape where each
+    vertex's (target - orig) delta is scaled by that influence's weight at
+    that vertex:
 
         new_pos[v] = orig_pos[v] + (target_pos[v] - orig_pos[v]) * weight[v]
 
-    All three meshes (weighted_geo, orig_shape, target_shape) must share
-    topology — vertex counts must match.
+    Influences are processed parent-before-child by DAG depth, so the
+    resulting shapes are emitted in hierarchy order.  Every influence must
+    carry at least one non-zero painted weight or the build aborts before
+    any shape is created.
+
+    All three meshes (the skinCluster's geometry, orig_shape, target_shape)
+    must share topology — vertex counts must match.
 
     Example:
         ZoneCorrectiveBuilder(
             pose="fist",
-            weighted_geo="blendWeights_2_ma:L_arm_001_GEO_blendWeights",
-            influence_joint="blendWeights_2_ma:lft_zone_1_guide",
+            skin_cluster="blendWeights_2_ma:L_arm_001_GEO_zoneWeight_skinCluster",
             orig_shape="L_arm_001_GEO_orig",
             target_shape="L_arm_001_GEO_testFist_target",
         ).build()
@@ -55,59 +60,82 @@ class ZoneCorrectiveBuilder:
     def __init__(
         self,
         pose: str,
-        weighted_geo: str,
-        influence_joint: str,
+        skin_cluster: str,
         orig_shape: str,
         target_shape: str,
-        name: str | None = None,
     ) -> None:
         self.pose: str = pose
-        self.weighted_geo: str = weighted_geo
-        self.influence_joint: str = influence_joint
+        self.skin_cluster: str = skin_cluster
         self.orig_shape: str = orig_shape
         self.target_shape: str = target_shape
-        self.name: str | None = name
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def build(self) -> str:
-        """Build the zone corrective mesh and return its transform name."""
+    def build(self) -> list[str]:
+        """Build one corrective per influence and return their names in
+        parent-before-child hierarchy order.
+        """
         self._validate_nodes()
+
+        geo = self._skin_cluster_geo(self.skin_cluster)
 
         orig_pts = self._mesh_points(self.orig_shape)
         target_pts = self._mesh_points(self.target_shape)
         self._require_same_count("orig", len(orig_pts), "target", len(target_pts))
 
-        skin_cluster = self._find_skin_cluster(self.weighted_geo)
-        weights = self._influence_weights(skin_cluster, self.weighted_geo, self.influence_joint)
-        self._require_same_count("weighted_geo", len(weights), "orig", len(orig_pts))
+        sc_sel = om.MSelectionList()
+        sc_sel.add(self.skin_cluster)
+        sc_fn = oma.MFnSkinCluster(sc_sel.getDependNode(0))
+        influences = cast("list[om.MDagPath]", sc_fn.influenceObjects())
 
-        out_name = self.name or self._default_name(self.pose, self.influence_joint)
-        new_mesh = cast("list[str]", mc.duplicate(self.orig_shape, name=out_name))[0]
-        print(f"  [+] Duplicated '{self.orig_shape}' -> '{new_mesh}'")
+        geo_dag = self._shape_dag(geo)
+        vert_count = cast("int", om.MFnMesh(geo_dag).numVertices)
+        self._require_same_count("geo", vert_count, "orig", len(orig_pts))
 
-        self._apply_weighted_deltas(new_mesh, orig_pts, target_pts, weights)
-        new_mesh = self._parent_to_targets_group(new_mesh)
-        print(
-            f"[ZONE] '{new_mesh}' "
-            f"<- target='{self.target_shape}' "
-            f"masked by '{self.influence_joint}' on '{self.weighted_geo}'"
+        comp_fn = om.MFnSingleIndexedComponent()
+        comp = comp_fn.create(om.MFn.kMeshVertComponent)
+        comp_fn.setCompleteData(vert_count)
+        all_weights, num_infl = cast(
+            "tuple[list[float], int]", sc_fn.getWeights(geo_dag, comp)
         )
-        return new_mesh
+
+        self._require_no_zero_influences(influences, all_weights, num_infl, vert_count)
+
+        sorted_idxs = sorted(
+            range(num_infl),
+            key=lambda i: (
+                influences[i].fullPathName().count("|"),
+                influences[i].fullPathName(),
+            ),
+        )
+
+        built: list[str] = []
+        for idx in sorted_idxs:
+            infl_name = influences[idx].partialPathName()
+            weights = [all_weights[v * num_infl + idx] for v in range(vert_count)]
+
+            out_name = self._default_name(self.pose, infl_name)
+            new_mesh = cast("list[str]", mc.duplicate(self.orig_shape, name=out_name))[0]
+            print(f"  [+] Duplicated '{self.orig_shape}' -> '{new_mesh}'")
+
+            self._apply_weighted_deltas(new_mesh, orig_pts, target_pts, weights)
+            new_mesh = self._parent_to_targets_group(new_mesh)
+            print(
+                f"[ZONE] '{new_mesh}' "
+                f"<- target='{self.target_shape}' "
+                f"masked by '{infl_name}' on '{geo}'"
+            )
+            built.append(new_mesh)
+        return built
 
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
 
     def _validate_nodes(self) -> None:
-        for node in (
-            self.weighted_geo,
-            self.influence_joint,
-            self.orig_shape,
-            self.target_shape,
-        ):
+        for node in (self.skin_cluster, self.orig_shape, self.target_shape):
             if not mc.objExists(node):
                 raise RuntimeError(f"Node not found: {node}")
 
@@ -115,6 +143,22 @@ class ZoneCorrectiveBuilder:
     def _require_same_count(a_name: str, a_count: int, b_name: str, b_count: int) -> None:
         if a_count != b_count:
             raise RuntimeError(f"Vertex count mismatch: {a_name}={a_count}, {b_name}={b_count}.")
+
+    @staticmethod
+    def _require_no_zero_influences(
+        influences: list[om.MDagPath],
+        all_weights: list[float],
+        num_infl: int,
+        vert_count: int,
+    ) -> None:
+        zero_infls: list[str] = []
+        for idx in range(num_infl):
+            if not any(all_weights[v * num_infl + idx] > 0.0 for v in range(vert_count)):
+                zero_infls.append(influences[idx].partialPathName())
+        if zero_infls:
+            raise RuntimeError(
+                f"Influences with no painted weights: {zero_infls}"
+            )
 
     # ------------------------------------------------------------------
     # Naming
@@ -165,48 +209,18 @@ class ZoneCorrectiveBuilder:
         )
 
     # ------------------------------------------------------------------
-    # Skin weights
+    # Skin cluster
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _find_skin_cluster(geo: str) -> str:
-        history = mc.listHistory(geo, pruneDagObjects=True) or []
-        clusters = mc.ls(history, type="skinCluster") or []
-        if not clusters:
-            raise RuntimeError(f"No skinCluster found on '{geo}'.")
-        return clusters[0]
-
-    def _influence_weights(self, skin_cluster: str, geo: str, joint: str) -> list[float]:
-        sc_sel = om.MSelectionList()
-        sc_sel.add(skin_cluster)
-        sc_fn = oma.MFnSkinCluster(sc_sel.getDependNode(0))
-
-        influences = cast("list[om.MDagPath]", sc_fn.influenceObjects())
-        index = self._find_influence_index(influences, joint)
-        if index < 0:
-            names = [influences[i].partialPathName() for i in range(len(influences))]
-            raise RuntimeError(
-                f"'{joint}' is not an influence of '{skin_cluster}'. " f"Influences: {names}"
-            )
-
-        geo_dag = self._shape_dag(geo)
-        vert_count = cast("int", om.MFnMesh(geo_dag).numVertices)
-        comp_fn = om.MFnSingleIndexedComponent()
-        comp = comp_fn.create(om.MFn.kMeshVertComponent)
-        comp_fn.setCompleteData(vert_count)
-
-        all_weights, num_infl = cast("tuple[list[float], int]", sc_fn.getWeights(geo_dag, comp))
-        return [all_weights[v * num_infl + index] for v in range(vert_count)]
-
-    @staticmethod
-    def _find_influence_index(influences: list[om.MDagPath], joint: str) -> int:
-        sel = om.MSelectionList()
-        sel.add(joint)
-        target_full = cast("om.MDagPath", sel.getDagPath(0)).fullPathName()
-        for i in range(len(influences)):
-            if influences[i].fullPathName() == target_full:
-                return i
-        return -1
+    def _skin_cluster_geo(skin_cluster: str) -> str:
+        geos = cast(
+            "list[str] | None",
+            mc.skinCluster(skin_cluster, query=True, geometry=True),
+        )
+        if not geos:
+            raise RuntimeError(f"SkinCluster '{skin_cluster}' has no geometry.")
+        return geos[0]
 
     # ------------------------------------------------------------------
     # Apply deltas
@@ -234,13 +248,3 @@ class ZoneCorrectiveBuilder:
             )
         fn.setPoints(new_pts, self.SPACE)
         fn.updateSurface()
-
-
-if __name__ == "__main__":
-    ZoneCorrectiveBuilder(
-        pose="fist",
-        weighted_geo="blendWeights_2_ma:L_arm_001_GEO_blendWeights",
-        influence_joint="blendWeights_2_ma:lft_zone_1_guide",
-        orig_shape="L_arm_001_GEO_orig",
-        target_shape="L_arm_001_GEO_testFist_target",
-    ).build()
