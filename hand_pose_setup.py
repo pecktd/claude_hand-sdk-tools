@@ -80,6 +80,7 @@ class HandPoseBuilder:
 
     FINGER_PARTS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
     DEFAULT_DRIVER_MAX: int = 10
+    SEPARATOR_ATTR: str = "__handPose__"
 
     def __init__(
         self,
@@ -110,6 +111,11 @@ class HandPoseBuilder:
         if not pose_sides:
             mc.warning(f"No finger pose joints found under '{self.pose_root}'.")
             return
+
+        for side in self.sides:
+            hand_ctrl = f"{side}_hand_ctrl"
+            if mc.objExists(hand_ctrl):
+                self._add_separator(hand_ctrl, self.SEPARATOR_ATTR)
 
         for (pose, side), joints in pose_sides.items():
             self.build_pose(pose, side, joints)
@@ -154,7 +160,6 @@ class HandPoseBuilder:
         built_part_attrs: list[str] = []
         match_only_ofsts: set[str] = set()
 
-        pose_separator_attr = self._pose_separator_attr_name(pose)
         whole_attr_name = self._whole_pose_attr_name(pose)
         whole_attr_plug = f"{hand_ctrl}.{whole_attr_name}"
         pose_attrs_added = False
@@ -182,7 +187,6 @@ class HandPoseBuilder:
                 if self._is_selected(pose, part, level):
                     if not level_has_sdk:
                         if not pose_attrs_added:
-                            self._add_separator(hand_ctrl, pose_separator_attr)
                             self._add_pose_float_attr(hand_ctrl, whole_attr_name, "whole")
                             pose_attrs_added = True
                         self._add_pose_float_attr(hand_ctrl, part_attr_name, "part")
@@ -222,11 +226,9 @@ class HandPoseBuilder:
     ) -> None:
         print(f"\n[POSE] '{pose}' [{side}] -> {hand_ctrl}  (whole-only)")
 
-        separator_attr = self._pose_separator_attr_name(pose)
         whole_attr_name = self._whole_pose_attr_name(pose)
         whole_attr_plug = f"{hand_ctrl}.{whole_attr_name}"
 
-        self._add_separator(hand_ctrl, separator_attr)
         self._add_pose_float_attr(hand_ctrl, whole_attr_name, "whole")
         self._ensure_norm_mult(f"{side}_{whole_attr_name}_outMult", whole_attr_plug)
         # Pre-set whole to max so each newly keyed joint snaps to its posed
@@ -386,10 +388,6 @@ class HandPoseBuilder:
     def _whole_pose_attr_name(pose: str) -> str:
         # Uppercase only the first letter; preserve any camelCase in the token.
         return f"pose{pose[:1].upper()}{pose[1:]}"
-
-    @staticmethod
-    def _pose_separator_attr_name(pose: str) -> str:
-        return f"__pose{pose[:1].upper()}{pose[1:]}__"
 
     @staticmethod
     def _sub_pose_attr_name(pose: str, level: int) -> str:
