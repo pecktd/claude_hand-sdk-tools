@@ -131,8 +131,6 @@ def run(
             )
 
         data[pose] = {
-            "driver": driver_attr,
-            "shape": shape,
             "frame_range": [start, end],
             "samples": samples,
         }
