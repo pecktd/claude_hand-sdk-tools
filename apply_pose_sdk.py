@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import maya.cmds as mc
 
-
 POSE_SHAPES = {
     "poseFist": {
         "frame_range": [0, 19],
@@ -1187,8 +1186,7 @@ def _apply_for_ctrl(pose_shapes: dict, ctrl: str, clear_existing: bool) -> None:
                     value=s["shape_values"][attr],
                 )
         print(
-            f"[{ctrl}/{pose}] built SDK for {len(active)} attr(s) "
-            f"across {len(samples)} key(s)"
+            f"[{ctrl}/{pose}] built SDK for {len(active)} attr(s) " f"across {len(samples)} key(s)"
         )
 
 
