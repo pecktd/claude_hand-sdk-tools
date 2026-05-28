@@ -11,11 +11,20 @@ importlib.reload(hand_pose_anim_setup)
 
 hand_pose_anim_setup.HandPoseAnimBuilder(
     pose_ranges={
-        "open2Pinky": (1010, 1030),
-        "open2Fist": (1050, 1070),
-        "open2Scissor": (1090, 1110),
-        "open2Pistol": (1130, 1150),
-        "fist2Scissor": (1180, 1200),
+        "pinky": (1010, 1030),
+        "fist": (1050, 1070),
+        "scissor": (1090, 1110),
+        "pistol": (1130, 1150),
+        # Chained delta pose: stacks on top of an existing pose so that
+        # base(max) + chained(max) lands on the target pose exactly.
+        "pistol2Fist": {
+            "range": (1150, 1170),
+            "base": "pistol",
+        },
+        "fist2Scissor": {
+            "range": (1200, 1220),
+            "base": "fist",
+        },
     },
 ).build()
 """
@@ -47,6 +56,27 @@ class HandPoseAnimBuilder:
     parent's already-posed world transform.  Once a pose's range is done,
     its ctrl_ofsts are reset to identity before moving to the next pose.
 
+    A pose_ranges value may also be a chained-pose spec::
+
+        {"range": (start, end), "base": "<existing_pose>"}
+
+    A chained pose layers on top of its base: both SDKs drive the same
+    ctrl_ofsts, and Maya merges coincident SDKs additively through a
+    `blendWeighted` node (``ctrl_ofst.channel = base_SDK + chained_SDK``).
+    A chained pose therefore stores the per-channel *delta* (target minus
+    base), never the absolute target -- absolutes would stack and double
+    up.  With deltas the math telescopes::
+
+        base(0)   + chained(0)   -> rest
+        base(max) + chained(0)   -> base pose
+        base(max) + chained(max) -> target pose, exactly
+
+    To capture those deltas the base driver is held at max (its posed value
+    is the delta origin that gets subtracted) while the chained driver poses
+    the already-built parent levels so children still match in world space.
+    See `build_chained_pose` for the capture mechanics -- notably why an
+    already-driven ofst must be read through a connection-free duplicate.
+
     During the build, auto-key is disabled and currentTime is restored on
     exit so the scene is left as it was found.
     """
@@ -58,11 +88,11 @@ class HandPoseAnimBuilder:
 
     def __init__(
         self,
-        pose_ranges: dict[str, tuple[int, int]],
+        pose_ranges: dict[str, tuple[int, int] | dict],
         sides: tuple[str, ...] = ("lft", "rgt"),
         max_driver_value: float = DEFAULT_DRIVER_MAX,
     ) -> None:
-        self.pose_ranges: dict[str, tuple[int, int]] = dict(pose_ranges)
+        self.pose_ranges: dict[str, tuple[int, int] | dict] = dict(pose_ranges)
         self.sides: tuple[str, ...] = tuple(sides)
         self.max_driver_value: float = float(max_driver_value)
 
@@ -80,7 +110,8 @@ class HandPoseAnimBuilder:
                 if mc.objExists(hand_ctrl):
                     self._add_separator(hand_ctrl, self.SEPARATOR_ATTR)
 
-            for pose, frame_range in self.pose_ranges.items():
+            for pose, spec in self.pose_ranges.items():
+                frame_range, base_pose = self._parse_spec(spec)
                 start_frame, end_frame = int(frame_range[0]), int(frame_range[1])
                 if start_frame >= end_frame:
                     mc.warning(
@@ -88,7 +119,10 @@ class HandPoseAnimBuilder:
                     )
                     continue
                 for side in self.sides:
-                    self.build_pose(pose, side, start_frame, end_frame)
+                    if base_pose is None:
+                        self.build_pose(pose, side, start_frame, end_frame)
+                    else:
+                        self.build_chained_pose(pose, side, start_frame, end_frame, base_pose)
         finally:
             mc.autoKeyframe(state=auto_key_state)
             mc.currentTime(initial_time, edit=True)
@@ -118,10 +152,7 @@ class HandPoseAnimBuilder:
         self._add_pose_float_attr(hand_ctrl, attr_name)
         self._ensure_norm_mult(f"{side}_{attr_name}_outMult", driver_plug)
 
-        print(
-            f"\n[POSE] '{pose}' [{side}] frames {start_frame}->{end_frame} "
-            f"-> {driver_plug}"
-        )
+        print(f"\n[POSE] '{pose}' [{side}] frames {start_frame}->{end_frame} " f"-> {driver_plug}")
 
         span = float(end_frame - start_frame)
 
@@ -154,6 +185,85 @@ class HandPoseAnimBuilder:
         # every SDK at its start-frame key (the open/rest pose).
         mc.setAttr(driver_plug, 0)
 
+    def build_chained_pose(
+        self,
+        pose: str,
+        side: str,
+        start_frame: int,
+        end_frame: int,
+        base_pose: str,
+    ) -> None:
+        """Build a delta SDK that stacks on top of an existing base pose.
+
+        The new SDK drives the same ctrl_ofsts as `base_pose`.  Because Maya
+        sums coincident SDKs (`blendWeighted`), storing the absolute target
+        transform would double up with the base; instead we store the
+        per-channel delta so that::
+
+            base(max) + chained(value) -> pose at this frame
+            base(max) + chained(max)   -> target pose, exactly
+
+        Capture, per level (parent-to-child):
+          - the base driver is held at max, so the ofst's base-only value is
+            the baseline we subtract (`base_local`);
+          - the chained driver is set proportionally, so already-built parent
+            levels evaluate base+chained to the frame-F pose and the child
+            matches correctly in world space;
+          - the ofst is already SDK-driven (connected), so `mc.xform` can't
+            write to it.  We read the *required* local transform from a
+            connection-free duplicate (`parentOnly`) sitting under the same
+            parent, then subtract `base_local` to get the delta.
+        """
+        hand_ctrl = f"{side}_hand_ctrl"
+        if not mc.objExists(hand_ctrl):
+            mc.warning(f"Missing: {hand_ctrl}")
+            return
+
+        pairs_by_level = self._discover_pairs(side)
+        if not pairs_by_level:
+            mc.warning(f"No pose joints found for side '{side}'.")
+            return
+
+        base_attr = self._pose_attr_name(base_pose)
+        base_plug = f"{hand_ctrl}.{base_attr}"
+        if not mc.attributeQuery(base_attr, node=hand_ctrl, exists=True):
+            mc.warning(
+                f"Base driver '{base_plug}' not found; build base pose "
+                f"'{base_pose}' before chained pose '{pose}'. Skipping."
+            )
+            return
+
+        attr_name = self._pose_attr_name(pose)
+        driver_plug = f"{hand_ctrl}.{attr_name}"
+
+        self._add_pose_float_attr(hand_ctrl, attr_name)
+        self._ensure_norm_mult(f"{side}_{attr_name}_outMult", driver_plug)
+
+        print(
+            f"\n[CHAIN] '{pose}' [{side}] frames {start_frame}->{end_frame} "
+            f"-> {driver_plug}  (base {base_plug})"
+        )
+
+        span = float(end_frame - start_frame)
+
+        # Hold the base pose fully on for the whole capture: parents pose to
+        # base + chained, and each ofst's base-only value is the delta origin.
+        mc.setAttr(base_plug, self.max_driver_value)
+
+        for level in sorted(pairs_by_level.keys()):
+            samples = self._sample_chained_level(
+                driver_plug, pairs_by_level[level], start_frame, end_frame, span
+            )
+            self._write_sdk_keys(driver_plug, samples)
+            print(
+                f"  [SDK] level {level}: wrote {len(samples)} delta key(s) "
+                f"across {len(pairs_by_level[level])} joint(s)"
+            )
+
+        # Reset both drivers so the scene rests at the open/rest pose.
+        mc.setAttr(driver_plug, 0)
+        mc.setAttr(base_plug, 0)
+
     def _sample_level(
         self,
         driver_plug: str,
@@ -179,6 +289,56 @@ class HandPoseAnimBuilder:
     ) -> None:
         for driver_value, ctrl_ofst, pose_t, pose_r in samples:
             self._set_sdk_key(driver_plug, ctrl_ofst, driver_value, pose_t, pose_r)
+
+    def _sample_chained_level(
+        self,
+        driver_plug: str,
+        pairs: list[tuple[str, str]],
+        start_frame: int,
+        end_frame: int,
+        span: float,
+    ) -> list[tuple[float, str, list[float], list[float]]]:
+        """Sample one level of a chained pose as per-channel deltas.
+
+        Assumes the base driver is already held at max by the caller.  For
+        each ofst we read its base-only local transform (the delta origin),
+        then at every frame read the required local transform from a
+        connection-free duplicate and subtract the origin.
+        """
+        # Connection-free probes (transform only, no incoming connections),
+        # parented as siblings of each ofst so local reads share the ofst's
+        # parent, rotateOrder and offsetParentMatrix.
+        probes: dict[str, str] = {}
+        for _src_jnt, ctrl_ofst in pairs:
+            probes[ctrl_ofst] = mc.duplicate(
+                ctrl_ofst, parentOnly=True, name=f"{ctrl_ofst}_poseProbe"
+            )[0]
+
+        # Delta origin: with the chained driver at 0 this level reads its
+        # base-only (e.g. pistol) local value.  Base SDKs are driven by the
+        # base attr, not time, so this is frame-independent.
+        mc.setAttr(driver_plug, 0)
+        base_local: dict[str, tuple[list[float], list[float]]] = {}
+        for _src_jnt, ctrl_ofst in pairs:
+            base_local[ctrl_ofst] = (
+                list(mc.xform(ctrl_ofst, query=True, translation=True)),
+                list(mc.xform(ctrl_ofst, query=True, rotation=True)),
+            )
+
+        samples: list[tuple[float, str, list[float], list[float]]] = []
+        for frame in range(int(start_frame), int(end_frame) + 1):
+            mc.currentTime(frame, edit=True)
+            driver_value = (frame - start_frame) / span * self.max_driver_value
+            mc.setAttr(driver_plug, driver_value)
+            for src_jnt, ctrl_ofst in pairs:
+                req_t, req_r = self._match_transform(src_jnt, probes[ctrl_ofst])
+                base_t, base_r = base_local[ctrl_ofst]
+                delta_t = [r - b for r, b in zip(req_t, base_t)]
+                delta_r = [r - b for r, b in zip(req_r, base_r)]
+                samples.append((driver_value, ctrl_ofst, delta_t, delta_r))
+
+        mc.delete(list(probes.values()))
+        return samples
 
     # ------------------------------------------------------------------
     # Discovery
@@ -214,6 +374,18 @@ class HandPoseAnimBuilder:
     # ------------------------------------------------------------------
     # Attribute helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_spec(spec: tuple[int, int] | dict) -> tuple[tuple[int, int], str | None]:
+        """Normalize a pose_ranges value into `(frame_range, base_pose)`.
+
+        A plain `(start, end)` sequence -> absolute pose (`base_pose` None).
+        A dict `{"range": (start, end), "base": "<pose>"}` -> chained delta
+        pose built relative to `<pose>`.
+        """
+        if isinstance(spec, dict):
+            return spec["range"], spec.get("base")
+        return spec, None
 
     @staticmethod
     def _pose_attr_name(pose: str) -> str:
